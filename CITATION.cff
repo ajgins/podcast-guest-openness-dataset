@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this dataset, please cite it as below."
+title: "Which Podcasts Actually Book Outside Guests? Guest-Openness Scores for 314 Shows"
+abstract: >-
+  314 podcasts scored 0 to 100 on how open they are to booking outside guests,
+  built from each show's own public RSS feed and its public Apple Podcasts listing.
+  14 niches. Measures published evidence of guest booking, never its absence.
+type: dataset
+license: CC-BY-4.0
+url: "https://letsmakeapodcast.com/research/which-podcasts-book-guests"
+repository-artifact: "https://letsmakeapodcast.com/research/which-podcasts-book-guests/data.csv"
+doi: "10.5281/zenodo.21310079"
+authors:
+  - name: "Let's Make A Podcast"
+    website: "https://letsmakeapodcast.com"
+keywords:
+  - podcasts
+  - podcast guests
+  - guest booking
+  - open data
+  - RSS
+  - creator economy
