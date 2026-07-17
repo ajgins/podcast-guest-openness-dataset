@@ -61,9 +61,9 @@ be checked against the show's live feed. There is no private signal.
 ## What the corpus says
 
 - **259 of 314** shows are still active.
-- **100** publish direct evidence that they book guests.
+- **99** publish direct evidence that they book guests.
 - **71** are dormant, and **66** are network run.
-- Feeds checked 2026-07-11.
+- Feeds checked 2026-07-16.
 
 The per niche breakdown and the write up are at **[https://letsmakeapodcast.com/research/which-podcasts-book-guests](https://letsmakeapodcast.com/research/which-podcasts-book-guests)**.
 
