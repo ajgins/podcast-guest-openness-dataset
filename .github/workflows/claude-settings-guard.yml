@@ -1,0 +1,33 @@
+name: claude-settings-guard
+# Fails when .claude/settings.local.json is tracked or not gitignored, or a Claude settings file holds a live
+# secret. Runs only when Claude settings or .gitignore change. Source: crossover-labs/security-check
+# tools/claude-settings-guard.py (copy at .github/claude-settings-guard.py).
+on:
+  push:
+    paths: ['.claude/**', '**/.claude/**', '.mcp.json', '**/.mcp.json', '.gitignore', '**/.gitignore',
+            '.github/claude-settings-guard.py', '.github/workflows/claude-settings-guard.yml']
+  pull_request:
+    paths: ['.claude/**', '**/.claude/**', '.mcp.json', '**/.mcp.json', '.gitignore', '**/.gitignore',
+            '.github/claude-settings-guard.py', '.github/workflows/claude-settings-guard.yml']
+permissions:
+  contents: read
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Claude settings guard
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          R=""
+          if [ -n "$BASE" ]; then R="$BASE..$HEAD_SHA"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then R="$BEFORE..$AFTER"; fi
+          python3 .github/claude-settings-guard.py ci ${R:+--range "$R"}
