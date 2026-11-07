@@ -1,0 +1,3 @@
+# Claude Code per-user settings: approved commands land here verbatim (tokens, passwords)
+**/.claude/settings.local.json
+**/.claude/settings.local.json.*
