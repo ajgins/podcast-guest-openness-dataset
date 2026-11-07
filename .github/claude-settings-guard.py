@@ -11,16 +11,20 @@ committed. Shared .claude/settings.json and .mcp.json are meant to be committed,
   claude-settings-guard ci [--range A..B]                              CI: tree + pushed range, exit 1 on fail
   claude-settings-guard install-hook <repo>... | --all-under DIR...    chain-install the pre-push hook
   claude-settings-guard install-ci <checkout>                          write the workflow + this file
+  claude-settings-guard hook-status [--fix] [--json] <root>...         is the pre-push guard still in every repo under
+                                                                       these roots (healthcare pruned); --fix re-installs
   claude-settings-guard selftest
 
 Findings carry type, JSON location and commit only. Secret values are never printed, logged or stored.
 Exit codes: 0 ok, 1 blocked/failed. pre-push fails OPEN on its own errors (prints a warning, allows the push).
 Bypass one push on purpose: CLAUDE_SETTINGS_GUARD=off git push ...
 Source of truth: crossover-labs/security-check tools/claude-settings-guard.py (2026-11-07, radar-act-1107-1).
+VERSION: bump it whenever what CI blocks or warns on changes. Every repo carries a copy (.github/claude-settings-guard.py);
+the weekly coverage pass (tools/claude-settings-coverage.py) refreshes copies whose VERSION is older, and only those.
 """
 import base64, hashlib, json, math, os, re, subprocess, sys, time
 
-VERSION = "2026-11-07.1"
+VERSION = "2026-11-07.2"  # .2: aea8567 empty-assignment fix (was shipped as .1), hook-status
 PATHSPECS = [":(glob)**/.claude/settings*", ":(glob)**/.mcp.json"]
 TARGET_RE = re.compile(r"(^|/)(\.claude/settings[^/]*|\.mcp\.json)$")
 LOCAL_RE = re.compile(r"(^|/)\.claude/settings\.local([._~-][^/]*)?$")  # settings.local.json + backups of it
@@ -91,6 +95,8 @@ def real_value(v):
     v = v.strip("'\"`")
     if len(v) < 4 or FAKE.search(v):
         return False
+    if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", v):
+        return False  # "KEY= NEXT=..." is an empty assignment followed by the next variable, not a value
     if any(c in v for c in "$*{}<>%") or v.startswith(("~", "/", "./", "../", "@", "-")):
         return False  # $VAR, permission wildcard, template, path, flag
     if re.fullmatch(r"[a-z][a-z._/-]*", v) or re.fullmatch(r"[A-Z][A-Z_]*", v):
@@ -343,8 +349,8 @@ def cmd_pre_push(argv):
 
 def ignored(repo, path=".claude/settings.local.json"):
     # The repo's own rules only: a machine's global excludes file must not hide a missing .gitignore line.
-    return subprocess.run(["git", "-C", repo, "-c", "core.excludesFile=/dev/null", "check-ignore", "-q", "--no-index",
-                           path]).returncode == 0
+    return subprocess.run(["git", "-c", "safe.directory=*", "-C", repo, "-c", "core.excludesFile=/dev/null", "check-ignore",
+                           "-q", "--no-index", path], capture_output=True).returncode == 0
 
 
 def cmd_ci(argv):
@@ -435,15 +441,200 @@ def install_hook(repo):
     return "installed" + (" (chained the existing hook)" if os.path.exists(os.path.join(hooks, "pre-push.chained")) else "")
 
 
+# Healthcare repos are never walked, read or changed by this tool (the hub may not act on them): the union of the
+# security-check, ci-watch and hipaa registry name rules. Callers may add the registry's local paths (skip_paths).
+HC_RX = re.compile(r"uptown|wald|cws|capital-?aesthetic|capitalaesthetic|capital-?wound|capitalwound|clinical|hipaa|"
+                   r"dr-johnson|mental-health|oak-star-dental|aesthetic|wound", re.I)
+WALK_PRUNE = ("node_modules", "DerivedData", "Pods", ".build", "build", ".venv", "venv", "__pycache__")
+
+
+def walk_repos(roots, skip_paths=()):
+    """Git work trees under roots (a repo's nested repos too), healthcare pruned by name before it is entered."""
+    skip = {os.path.realpath(os.path.expanduser(p)) for p in skip_paths}
+    out = []
+    for root in roots:
+        root = os.path.expanduser(root)
+        if HC_RX.search(root) or not os.path.isdir(root):
+            continue
+        for dp, dns, fns in os.walk(root):
+            dns[:] = sorted(d for d in dns if d not in WALK_PRUNE and not HC_RX.search(d)
+                            and os.path.realpath(os.path.join(dp, d)) not in skip)
+            if ".git" in dns or ".git" in fns:
+                out.append(dp)
+                dns[:] = [d for d in dns if d != ".git"]
+    return out
+
+
+def hook_state(repo):
+    """-> (state, detail). ok | ok-ci (own core.hooksPath, repo carries the CI workflow) | outdated (our hook, older
+    text) | missing (no pre-push) | foreign (another tool's pre-push, no chain yet: install chains it) | not-exec |
+    conflict (foreign pre-push AND a pre-push.chained: a tool rewrote our hook after we chained, needs a person) |
+    uncovered (own core.hooksPath without our hook and no CI workflow: nothing checks this repo's pushes)."""
+    g = ["git", "-c", "safe.directory=*", "-C", repo]
+    cd = subprocess.run(g + ["rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True).stdout.strip()
+    if not cd:
+        return "not-a-repo", ""
+    hp = subprocess.run(g + ["config", "core.hooksPath"], capture_output=True, text=True).stdout.strip()
+    if hp:
+        hd = hp if os.path.isabs(hp) else os.path.join(repo, hp)
+        dst = os.path.join(os.path.expanduser(hd), "pre-push")
+        if os.path.isfile(dst) and HOOK_MARK in open(dst, errors="replace").read():
+            return "ok", f"core.hooksPath={hp}"
+        wfp = ".github/workflows/claude-settings-guard.yml"
+        if subprocess.run(g + ["ls-files", "--", wfp], capture_output=True, text=True).stdout.strip():
+            return "ok-ci", f"core.hooksPath={hp}, CI workflow tracked"
+        for ref in ("refs/remotes/origin/HEAD", "refs/remotes/origin/main", "refs/remotes/origin/master"):
+            if subprocess.run(g + ["ls-tree", "--name-only", ref, "--", wfp], capture_output=True, text=True).stdout.strip():
+                return "ok-ci", f"core.hooksPath={hp}, CI workflow on {ref.split('/', 2)[2]} (this branch predates it)"
+        return "uncovered", f"core.hooksPath={hp}, no CI workflow"
+    hooks = os.path.join(cd, "hooks")
+    dst, chained = os.path.join(hooks, "pre-push"), os.path.join(hooks, "pre-push.chained")
+    if not (os.path.exists(dst) or os.path.islink(dst)):
+        return "missing", ""
+    cur = open(dst, errors="replace").read() if os.path.isfile(dst) else ""
+    if HOOK_MARK in cur:
+        if not os.access(dst, os.X_OK):
+            return "not-exec", "pre-push lost its execute bit (git skips it silently)"
+        return ("ok", "") if cur == HOOK else ("outdated", "older guard hook text")
+    if os.path.exists(chained):
+        return "conflict", "pre-push rewritten by another tool after the guard chained the old one"
+    return "foreign", "another pre-push hook, guard not chained"
+
+
+FIXABLE = ("missing", "foreign", "outdated", "not-exec")
+OUR_REMOTE = re.compile(r"github\.com[:/](ajgins|blrbdigital|crossover-labs)/", re.I)
+
+
+def pushes_somewhere(repo):
+    """In scope for the push-time guard: a remote on our GitHub owners, or any SSH remote (client orgs we push to,
+    e.g. 3rd-i). A read-only HTTPS clone of a third-party project (firecrawl) or a repo without remotes is not."""
+    urls = subprocess.run(["git", "-c", "safe.directory=*", "-C", repo, "remote", "-v"], capture_output=True,
+                          text=True).stdout.split()
+    return any(OUR_REMOTE.search(u) or u.startswith(("git@", "ssh://")) for u in urls)
+
+
+def global_excludes():
+    p = subprocess.run(["git", "config", "--global", "--get", "core.excludesFile"], capture_output=True, text=True).stdout.strip()
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.expanduser(p) if p else os.path.join(xdg, "git", "ignore")
+
+
+def drift_report(roots, skip_paths=(), fix=False, bins=("~/.local/bin/claude-settings-guard", "/usr/local/bin/claude-settings-guard")):
+    """Everything the push-time guard depends on, on this machine (monaudit-csg-1107). -> (findings, fixed)
+    findings: [{key, severity, title, detail, fix}] (state that needs a person or a later run); fixed: [str] repairs made
+    now (re-installed hooks, template hook, excludes lines). The hook FAILS OPEN when the binary is missing, so a
+    missing or broken binary is high: every repo's pushes go unchecked without any error."""
+    F, fixed = [], []
+
+    def add(key, sev, title, detail, how):
+        F.append({"key": key, "severity": sev, "title": title, "detail": detail, "fix": how})
+    found = [os.path.expanduser(b) for b in bins if os.path.isfile(os.path.expanduser(b)) and os.access(os.path.expanduser(b), os.X_OK)]
+    if not found:
+        add("bin.missing", "high", "claude-settings-guard binary missing: every pre-push hook here fails open",
+            ", ".join(bins), "Reinstall it (Mini: cp tools/claude-settings-guard.py ~/.local/bin/claude-settings-guard; VPS: deploy/install-vps.sh)")
+    else:
+        b = found[0]
+        st = subprocess.run([b, "selftest"], capture_output=True, text=True, timeout=120)
+        ver = subprocess.run([b, "version"], capture_output=True, text=True, timeout=60).stdout.strip()
+        if st.returncode != 0:
+            add("bin.selftest", "high", "claude-settings-guard selftest fails: the pre-push hook would fail open",
+                b + ": " + (st.stdout + st.stderr).strip().splitlines()[-1][:200] if (st.stdout + st.stderr).strip() else b,
+                "python3 tests/test_claude_settings_guard.py, fix, reinstall")
+        elif ver != VERSION:
+            add("bin.version", "medium", f"installed claude-settings-guard is {ver or '?'}, source is {VERSION}", b,
+                "Reinstall from crossover-labs/security-check (Mini: cp; VPS: deploy/install-vps.sh)")
+    tdir = subprocess.run(["git", "config", "--global", "--get", "init.templateDir"], capture_output=True, text=True).stdout.strip()
+    if not tdir:
+        add("template.unset", "medium", "git init.templateDir is not set: new clones get no pre-push guard", "",
+            "git config --global init.templateDir ~/.config/git/template (holds hooks/pre-push)")
+    else:
+        tp = os.path.join(os.path.expanduser(tdir), "hooks", "pre-push")
+        cur = open(tp, errors="replace").read() if os.path.isfile(tp) else ""
+        if cur != HOOK and (fix and (not cur or HOOK_MARK in cur)):
+            os.makedirs(os.path.dirname(tp), exist_ok=True)
+            with open(tp, "w") as f:
+                f.write(HOOK)
+            os.chmod(tp, 0o755)
+            fixed.append(f"template hook {'re-written' if cur else 'restored'}: {tp}")
+        elif cur != HOOK:
+            add("template.hook", "medium", "the git template's pre-push is not the guard: new clones get no guard",
+                tp + (" (another hook there)" if cur else " (missing)"), "claude-settings-guard install-hook on the template, or restore the file")
+    ex = global_excludes()
+    have = open(ex, errors="replace").read() if os.path.isfile(ex) else ""
+    if "**/.claude/settings.local.json" not in have:
+        if fix:
+            os.makedirs(os.path.dirname(ex), exist_ok=True)
+            with open(ex, "a") as f:
+                f.write(("" if not have or have.endswith("\n") else "\n") + "".join(l + "\n" for l in GITIGNORE_LINES))
+            fixed.append(f"global excludes line restored: {ex}")
+        else:
+            add("excludes", "medium", "global git excludes no longer ignore .claude/settings.local.json", ex,
+                "append '**/.claude/settings.local.json' to it")
+    for r in walk_repos(roots, skip_paths):
+        if not pushes_somewhere(r):
+            continue
+        st, detail = hook_state(r)
+        if st in ("ok", "ok-ci", "not-a-repo"):
+            continue
+        if st in FIXABLE:
+            if fix and not os.path.exists(os.path.join(r, ".agent.lock")):
+                try:
+                    res = install_hook(r)
+                except OSError as e:
+                    res = f"error: {e}"
+                if res.startswith(("installed", "ok")):
+                    fixed.append(f"pre-push guard re-installed ({st}): {r}")
+                    continue
+                detail = (detail + "; " if detail else "") + "re-install: " + res
+            elif fix:
+                detail = (detail + "; " if detail else "") + "fleet run live (.agent.lock): re-installed after it ends"
+            add(f"hook.{st}.{r}", "medium", f"pre-push guard {st} in {r}", detail, f"claude-settings-guard install-hook {r}")
+        elif st == "conflict":
+            add(f"hook.conflict.{r}", "medium", f"pre-push guard overwritten by another tool in {r}", detail,
+                "Merge by hand: keep the tool's hook as pre-push.chained and put the guard hook back (claude-settings-guard install-hook)")
+        elif st == "uncovered":
+            # the repo's .gitignore or this machine's global excludes still keep the file out of 'git add'
+            safe = subprocess.run(["git", "-c", "safe.directory=*", "-C", r, "check-ignore", "-q", "--no-index",
+                                   ".claude/settings.local.json"], capture_output=True).returncode == 0
+            add(f"hook.uncovered.{r}", "low" if safe else "medium",
+                f"no push-time Claude settings check in {r}", detail + ("; settings.local.json is still gitignored, so only "
+                "'git add -f' or a secret in a shared settings.json gets through" if safe else "; settings.local.json is NOT ignored"),
+                "add the guard to the repo's own hooks dir (core.hooksPath) or merge the claude-settings-guard workflow")
+    return F, fixed
+
+
+def cmd_hook_status(argv):
+    fix, as_json = "--fix" in argv, "--json" in argv
+    roots = [a for a in argv if not a.startswith("--")]
+    rows = []
+    for r in walk_repos(roots):
+        st, detail = hook_state(r)
+        if fix and st in FIXABLE:
+            if os.path.exists(os.path.join(r, ".agent.lock")):
+                detail = (detail + "; " if detail else "") + "not fixed: fleet run live (.agent.lock)"
+            else:
+                try:
+                    detail = (detail + "; " if detail else "") + "fixed: " + install_hook(r)
+                except OSError as e:
+                    detail = (detail + "; " if detail else "") + f"fix failed: {e}"
+        rows.append({"repo": r, "state": st, "detail": detail})
+    if as_json:
+        print(json.dumps(rows, indent=1))
+    else:
+        for x in rows:
+            print(f"{x['repo']}\t{x['state']}\t{x['detail']}")
+        counts = {}
+        for x in rows:
+            counts[x["state"]] = counts.get(x["state"], 0) + 1
+        print("hook-status: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())), file=sys.stderr)
+    return 1 if any(x["state"] not in ("ok", "ok-ci", "not-a-repo") and "fixed: installed" not in x["detail"]
+                    and "fixed: ok" not in x["detail"] for x in rows) else 0
+
+
 def cmd_install_hook(argv):
     repos = []
     if argv and argv[0] == "--all-under":
-        for root in argv[1:]:
-            for dp, dns, fns in os.walk(os.path.expanduser(root)):
-                dns[:] = [d for d in dns if d not in ("node_modules", "DerivedData", "Pods", ".build", "build")]
-                if ".git" in dns or ".git" in fns:
-                    repos.append(dp)
-                    dns[:] = [d for d in dns if d != ".git"]
+        repos = walk_repos(argv[1:])  # healthcare pruned (HC_RX)
     else:
         repos = argv
     for r in repos:
@@ -534,6 +725,7 @@ def cmd_selftest(argv):
                                                "Bash(gh auth token)", "Bash(git commit -m *)", "Read(~/.config/token)",
                                                "Bash(curl -H \"Authorization: Bearer $TOKEN\" *)"]}}), set()),
         (json.dumps({"env": {"MAX_TOKENS": "4096", "CLAUDE_CODE_USE_BEDROCK": "0"}}), set()),
+        (json.dumps({"permissions": {"allow": ["Bash(STRIPE_SECRET_KEY= STRIPE_WEBHOOK_SECRET= PORT=8080 node server.js)"]}}), set()),
         ("not json " + k, {"stripe-live-secret-key"}),
     ]
     bad = 0
@@ -555,7 +747,7 @@ def main():
         return 0
     cmd, argv = sys.argv[1], sys.argv[2:]
     return {"history": cmd_history, "pre-push": cmd_pre_push, "ci": cmd_ci, "install-hook": cmd_install_hook,
-            "install-ci": cmd_install_ci, "selftest": cmd_selftest, "version": lambda a: print(VERSION) or 0}[cmd](argv)
+            "install-ci": cmd_install_ci, "hook-status": cmd_hook_status, "selftest": cmd_selftest, "version": lambda a: print(VERSION) or 0}[cmd](argv)
 
 
 if __name__ == "__main__":
